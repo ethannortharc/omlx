@@ -776,6 +776,204 @@ class TestTTSGenParamsEndpoint:
 
 
 # ---------------------------------------------------------------------------
+# TestTTSResponseFormat — response_format=mp3/opus/aac/flac/wav/pcm (#753)
+# ---------------------------------------------------------------------------
+
+
+def _ffmpeg_available() -> bool:
+    """True when an ffmpeg binary is discoverable on PATH."""
+    import shutil
+
+    return shutil.which("ffmpeg") is not None
+
+
+class TestTTSResponseFormat:
+    """Verify POST /v1/audio/speech honours the ``response_format`` field (#753).
+
+    Tests run against real ffmpeg transcoding on top of mocked TTSEngine WAV
+    bytes, so the TTS model isn't required but ffmpeg is.
+    """
+
+    # --- Route-level tests -------------------------------------------------
+
+    def test_wav_returns_riff_and_audio_wav(self, server_tts_client):
+        """Default/explicit wav keeps RIFF header and audio/wav Content-Type."""
+        client, _ = server_tts_client
+        response = client.post(
+            "/v1/audio/speech",
+            json={"model": "qwen3-tts", "input": "Hi", "response_format": "wav"},
+        )
+        assert response.status_code == 200
+        assert response.content[:4] == RIFF_MAGIC
+        assert "audio/wav" in response.headers.get("content-type", "")
+
+    def test_mp3_returns_mp3_magic_and_audio_mpeg(self, server_tts_client):
+        """response_format=mp3 produces MP3 bytes with audio/mpeg Content-Type."""
+        if not _ffmpeg_available():
+            pytest.skip("ffmpeg required for format conversion")
+        client, _ = server_tts_client
+        response = client.post(
+            "/v1/audio/speech",
+            json={"model": "qwen3-tts", "input": "Hi", "response_format": "mp3"},
+        )
+        assert response.status_code == 200
+        assert "audio/mpeg" in response.headers.get("content-type", "")
+        # MP3 starts with ID3 tag or 0xFFE/0xFFF sync frame.
+        head = response.content[:3]
+        assert head == b"ID3" or (response.content[:1] == b"\xff" and (response.content[1] & 0xE0) == 0xE0)
+
+    def test_opus_returns_ogg_container_and_audio_ogg(self, server_tts_client):
+        """response_format=opus produces Ogg/Opus bytes with audio/ogg Content-Type."""
+        if not _ffmpeg_available():
+            pytest.skip("ffmpeg required for format conversion")
+        client, _ = server_tts_client
+        response = client.post(
+            "/v1/audio/speech",
+            json={"model": "qwen3-tts", "input": "Hi", "response_format": "opus"},
+        )
+        assert response.status_code == 200
+        assert "audio/ogg" in response.headers.get("content-type", "")
+        # Ogg container always starts with 'OggS'.
+        assert response.content[:4] == b"OggS"
+
+    def test_flac_returns_flac_magic_and_audio_flac(self, server_tts_client):
+        """response_format=flac produces FLAC bytes with audio/flac Content-Type."""
+        if not _ffmpeg_available():
+            pytest.skip("ffmpeg required for format conversion")
+        client, _ = server_tts_client
+        response = client.post(
+            "/v1/audio/speech",
+            json={"model": "qwen3-tts", "input": "Hi", "response_format": "flac"},
+        )
+        assert response.status_code == 200
+        assert "audio/flac" in response.headers.get("content-type", "")
+        assert response.content[:4] == b"fLaC"
+
+    def test_aac_returns_aac_bytes_and_audio_aac(self, server_tts_client):
+        """response_format=aac produces ADTS AAC bytes with audio/aac Content-Type."""
+        if not _ffmpeg_available():
+            pytest.skip("ffmpeg required for format conversion")
+        client, _ = server_tts_client
+        response = client.post(
+            "/v1/audio/speech",
+            json={"model": "qwen3-tts", "input": "Hi", "response_format": "aac"},
+        )
+        assert response.status_code == 200
+        assert "audio/aac" in response.headers.get("content-type", "")
+        # ADTS sync word: 12-bit 0xFFF.
+        first = response.content[:2]
+        assert first[:1] == b"\xff" and (first[1] & 0xF0) == 0xF0
+
+    def test_pcm_strips_wav_header_and_has_audio_pcm(self, server_tts_client):
+        """response_format=pcm returns raw PCM (no RIFF) with audio/pcm Content-Type."""
+        if not _ffmpeg_available():
+            pytest.skip("ffmpeg required for format conversion")
+        client, _ = server_tts_client
+        response = client.post(
+            "/v1/audio/speech",
+            json={"model": "qwen3-tts", "input": "Hi", "response_format": "pcm"},
+        )
+        assert response.status_code == 200
+        assert "audio/pcm" in response.headers.get("content-type", "")
+        assert response.content[:4] != RIFF_MAGIC
+        # Raw 16-bit PCM: byte count must be even.
+        assert len(response.content) % 2 == 0
+
+    def test_invalid_response_format_returns_400(self, server_tts_client):
+        """Unsupported response_format returns 400 with a descriptive error."""
+        client, _ = server_tts_client
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "qwen3-tts",
+                "input": "Hi",
+                "response_format": "wma",
+            },
+        )
+        assert response.status_code == 400
+        body = response.json()
+        message = (
+            body.get("detail")
+            or body.get("error", {}).get("message", "")
+        )
+        assert "response_format" in message.lower() or "format" in message.lower()
+
+    def test_case_insensitive_response_format(self, server_tts_client):
+        """response_format is case-insensitive: 'OPUS' works the same as 'opus'."""
+        if not _ffmpeg_available():
+            pytest.skip("ffmpeg required for format conversion")
+        client, _ = server_tts_client
+        response = client.post(
+            "/v1/audio/speech",
+            json={"model": "qwen3-tts", "input": "Hi", "response_format": "OPUS"},
+        )
+        assert response.status_code == 200
+        assert "audio/ogg" in response.headers.get("content-type", "")
+        assert response.content[:4] == b"OggS"
+
+    # --- audio_utils.transcode_wav_bytes helper ---------------------------
+
+    def test_transcode_wav_to_wav_is_passthrough(self):
+        """transcode_wav_bytes returns the original bytes for format='wav'."""
+        from omlx.engine.audio_utils import transcode_wav_bytes
+
+        out = transcode_wav_bytes(DUMMY_WAV, "wav")
+        assert out == DUMMY_WAV
+
+    def test_transcode_wav_to_pcm_strips_header(self):
+        """transcode to pcm strips the RIFF header, leaves only sample bytes."""
+        from omlx.engine.audio_utils import transcode_wav_bytes
+
+        out = transcode_wav_bytes(DUMMY_WAV, "pcm")
+        assert out[:4] != RIFF_MAGIC
+        assert len(out) > 0
+        assert len(out) % 2 == 0
+
+    def test_transcode_wav_to_opus_produces_ogg(self):
+        """transcode to opus returns Ogg/Opus bytes (starts with OggS)."""
+        if not _ffmpeg_available():
+            pytest.skip("ffmpeg required for format conversion")
+        from omlx.engine.audio_utils import transcode_wav_bytes
+
+        out = transcode_wav_bytes(DUMMY_WAV, "opus")
+        assert out[:4] == b"OggS"
+
+    def test_transcode_wav_to_mp3_produces_mp3(self):
+        """transcode to mp3 returns MP3 bytes (ID3 tag or sync frame)."""
+        if not _ffmpeg_available():
+            pytest.skip("ffmpeg required for format conversion")
+        from omlx.engine.audio_utils import transcode_wav_bytes
+
+        out = transcode_wav_bytes(DUMMY_WAV, "mp3")
+        assert out[:3] == b"ID3" or (out[:1] == b"\xff" and (out[1] & 0xE0) == 0xE0)
+
+    def test_transcode_wav_to_flac_produces_flac(self):
+        """transcode to flac returns FLAC bytes (starts with fLaC)."""
+        if not _ffmpeg_available():
+            pytest.skip("ffmpeg required for format conversion")
+        from omlx.engine.audio_utils import transcode_wav_bytes
+
+        out = transcode_wav_bytes(DUMMY_WAV, "flac")
+        assert out[:4] == b"fLaC"
+
+    def test_transcode_wav_to_aac_produces_adts(self):
+        """transcode to aac returns ADTS AAC bytes (0xFFF sync word)."""
+        if not _ffmpeg_available():
+            pytest.skip("ffmpeg required for format conversion")
+        from omlx.engine.audio_utils import transcode_wav_bytes
+
+        out = transcode_wav_bytes(DUMMY_WAV, "aac")
+        assert out[:1] == b"\xff" and (out[1] & 0xF0) == 0xF0
+
+    def test_transcode_invalid_format_raises(self):
+        """Unsupported target format raises ValueError."""
+        from omlx.engine.audio_utils import transcode_wav_bytes
+
+        with pytest.raises(ValueError):
+            transcode_wav_bytes(DUMMY_WAV, "wma")
+
+
+# ---------------------------------------------------------------------------
 # Integration test (slow, requires mlx-audio)
 # ---------------------------------------------------------------------------
 

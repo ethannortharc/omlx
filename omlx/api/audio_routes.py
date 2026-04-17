@@ -169,12 +169,31 @@ async def create_transcription(
 @router.post("/v1/audio/speech")
 async def create_speech(request: AudioSpeechRequest):
     """OpenAI-compatible text-to-speech endpoint."""
+    import asyncio
+
+    from omlx.engine.audio_utils import (
+        SUPPORTED_TTS_FORMATS,
+        TTS_FORMAT_MEDIA_TYPES,
+        TranscodeError,
+        transcode_wav_bytes,
+    )
     from omlx.engine.tts import TTSEngine
     from omlx.exceptions import ModelNotFoundError
 
     # Validate input is non-empty
     if not request.input:
         raise HTTPException(status_code=400, detail="'input' field must not be empty")
+
+    # Validate response_format against OpenAI-compatible values (#753).
+    response_format = (request.response_format or "wav").lower()
+    if response_format not in SUPPORTED_TTS_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported response_format '{request.response_format}'. "
+                f"Supported values: {sorted(SUPPORTED_TTS_FORMATS)}"
+            ),
+        )
 
     # --- Validate and decode ref_audio (voice clone) ---
     audio_bytes = None
@@ -256,7 +275,21 @@ async def create_speech(request: AudioSpeechRequest):
             except OSError:
                 pass
 
-    return Response(content=wav_bytes, media_type="audio/wav")
+    # Transcode WAV to the requested output format. ffmpeg-backed conversions
+    # run on a worker thread so they don't block the event loop.
+    try:
+        output_bytes = await asyncio.to_thread(
+            transcode_wav_bytes, wav_bytes, response_format
+        )
+    except TranscodeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except ValueError as exc:  # defensive — already validated above
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return Response(
+        content=output_bytes,
+        media_type=TTS_FORMAT_MEDIA_TYPES[response_format],
+    )
 
 
 @router.post("/v1/audio/process")
